@@ -5,6 +5,13 @@ GuidedWorkflowUI.prototype = {
 		this._workflow_step_table = "x_nuvo_eam_guided_workflow_steps";
     },
 
+	_getContextConfig: function(url_param){
+		var disabledLocationProviderContexts =
+			{"ms_outlook_reservation": "ms_outlook_reservation"};
+		var disableURLRewrite = disabledLocationProviderContexts[url_param] || false;
+		return {url_param: url_param, disableURLRewrite: disableURLRewrite};
+	},
+
 	_getTableFromURLConfig: function(url_param){
 		var gr = new GlideRecord(this._workflow_recipe_table);
 		gr.get("url_parameter", url_param);
@@ -16,7 +23,7 @@ GuidedWorkflowUI.prototype = {
 		gs.error(log);
 	},
 
-	_getGR: function(sys_id, tableName, url_param){
+	_getGR: function(sys_id, tableName, encodedQuery){
 		if(!sys_id || !tableName){
 			var log = ["Missing required params for building stateful UI Object",
 					   "SYS ID:", sys_id,
@@ -25,23 +32,29 @@ GuidedWorkflowUI.prototype = {
 			return gs.error(log);
 		}
 		var gr = new GlideRecord(tableName);
-		if(sys_id === "-1"){
+
+		if(sys_id === "-1" && !encodedQuery){
 		  gr.newRecord();
 		  return gr;
 		}
 
-		gr.get(sys_id);
+		if(sys_id && sys_id !== "-1"){ gr.addQuery("sys_id", sys_id); }
+		// No encoded query necessary if access available to sys_id
+		if(encodedQuery && sys_id === '-1'){ gr.addEncodedQuery(encodedQuery); }
+
+		gr.setLimit(1);
+		gr.query();
+		gr.next();
+
 		return gr ? gr : gs.error(["No GlideRecord found on table", tableName, "with sys_id", sys_id].join(" "));
 	},
 
 	_setFirstIterationParams: function(results, stepGR, recordGR){
 		var auto_save = stepGR.guided_workflow_recipe.auto_save_endpoint;
-		var url_param = stepGR.guided_workflow_recipe.url_parameter;
 		results.record_sys_id = recordGR.getValue("sys_id");
 		results.record_table = recordGR.getTableName();
-		var data = new GuidedWorkflowData().getData(url_param, recordGR);
+		var data = new GuidedWorkflowData().getData(recordGR);
 		results.data = data ? data : {};
-
 		return results;
 	},
 
@@ -95,26 +108,30 @@ GuidedWorkflowUI.prototype = {
 		return stepGR;
 	},
 
-	_getConfigSysIdFromExistingRecord: function(gr){
+	_getConfigSysIdFromExistingRecord: function(gr, url_param){
 		var recipeGR = new GlideRecord(this._workflow_recipe_table);
 		var table = gr.getTableName();
+		if(url_param){ recipeGR.addQuery("url_parameter", url_param); }
 		recipeGR.addQuery("table", table);
 		recipeGR.orderBy("order");
 		recipeGR.query();
 		var util = new GuidedWorkflowEvaluator();
 		var match;
+		var defaultStep;
 		while(!match && recipeGR.next()){
+			if(recipeGR.getValue("default_value")){ defaultStep = recipeGR.getValue("sys_id"); }
 			if(util.matchesCondition(recipeGR, gr)){
 			     match = recipeGR.getValue("sys_id");
 			}
 		}
 
-		return match ? match : gs.error("No matching config found for given GlideRecord " + gr.getTableName() + " " + "with sys_id " + gr.getValue("sys_id"));
+		return match ? match :
+		(gs.error("No matching config found for given GlideRecord " + gr.getTableName() + " " + "with sys_id " + gr.getValue("sys_id") + " and url param " + url_param) || defaultStep);
 	},
 
-	_getStepGRFromKnownRecord: function(gr){
+	_getStepGRFromKnownRecord: function(gr, url_param){
 		var stepGR = new GlideRecord(this._workflow_step_table);
-		var config_sys_id = this._getConfigSysIdFromExistingRecord(gr);
+		var config_sys_id = this._getConfigSysIdFromExistingRecord(gr, url_param);
 		stepGR.addQuery("guided_workflow_recipe", config_sys_id);
 		stepGR.orderBy("order");
 		stepGR.query();
@@ -126,7 +143,7 @@ GuidedWorkflowUI.prototype = {
 		return stepGR;
 	},
 
-	_getStatefulUIConfigURL: function(url_param, gr_sys_id, table){
+	_getStatefulUIConfigURL: function(url_param, gr_sys_id, encodedQuery){
 	  if(!gr_sys_id || !url_param){
 		  var log = ["Missing required function args necessary to retrieve guided workflow config",
 					 gr_sys_id, url_param].join(" ***** ");
@@ -134,41 +151,58 @@ GuidedWorkflowUI.prototype = {
 		  return {};
 	  }
 
-	  if(gr_sys_id == "-1"){
+	  if(gr_sys_id === "-1" && !encodedQuery){
 		 var stepGR = this._getStepGRFromURL(url_param);
 		 return this._getStatefulConfigForSteps(stepGR, gr_sys_id);
 	  }
 
 	   // for previously created records, make extra db call when table not included in URL
-	  var recordTable = table || this._getTableFromURLConfig(url_param);
-	  var params = {record_table: recordTable, record_sys_id: gr_sys_id};
+	  var recordTable = this._getTableFromURLConfig(url_param);
+	  var params = {record_table: recordTable,
+					record_sys_id: gr_sys_id,
+					url_param: url_param,
+					sysparm_query: encodedQuery };
 	  return this.getStatefulUIConfigKnownRecord(params);
+	},
+
+	_getStepsFromGR: function(gr, record_sys_id, url_param){
+	  var stepGR = this._getStepGRFromKnownRecord(gr, url_param);
+	  return this._getStatefulConfigForSteps(stepGR, record_sys_id, gr);
 	},
 
 	getStatefulUIConfigKnownRecord: function(params){
 	  var record_sys_id = params.record_sys_id;
 	  var record_table = params.record_table;
-	  if(!record_sys_id || !record_table){
+	  var encodedQuery = params.sysparm_query || "";
+	  var url_param = params.url_param || "";
+	  if(!record_sys_id || !record_table || !url_param){
 		  var log = ["Missing attributes on params object which are necessary to retrieve guided workflow config",
-					 record_sys_id, record_table].join(" ***** ");
+					 record_sys_id, record_table, url_param].join(" ***** ");
 		  gs.error(log);
 		  return {};
 	  }
 
-	  var gr = this._getGR(record_sys_id, record_table);
-	  var stepGR = this._getStepGRFromKnownRecord(gr);
-	  return this._getStatefulConfigForSteps(stepGR, record_sys_id, gr);
+	  var recordGR = this._getGR(record_sys_id, record_table, encodedQuery);
+	  if(!recordGR.isNewRecord() && recordGR.getValue("sys_id")){
+		  record_sys_id = recordGR.getValue("sys_id");
+	  }
+	  return this._getStepsFromGR(recordGR, record_sys_id, url_param);
 	},
 
-	getUIConfigJSON: function(url_param){
+	_getUIConfig: function(url_param){
 	  var action = gs.action;
 	  var uri = action.getGlideURI();
 	  var app_param = uri.get('guide') || url_param;
 	  var sys_id = uri.get('sys_id') || "-1";
-	  var config = this._getStatefulUIConfigURL(app_param, sys_id) || {};
-	  config.url_param = app_param;
-	  var encoded = JSON.stringify(config);
-	  return encoded;
+	  var encodedQuery = uri.get("sysparm_query") || "";
+	  var config = this._getStatefulUIConfigURL(app_param, sys_id, encodedQuery) || {};
+	  config.context = this._getContextConfig(url_param);
+	  return config;
+	},
+
+	getUIConfigJSON: function(url_param){
+	  var config = this._getUIConfig(url_param);
+	  return JSON.stringify(config);
 	},
 
     type: 'GuidedWorkflowUI'
